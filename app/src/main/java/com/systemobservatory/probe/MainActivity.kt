@@ -14,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.systemobservatory.probe.model.ProbeReport
 import com.systemobservatory.probe.model.RootState
@@ -60,8 +61,9 @@ class MainActivity : ComponentActivity() {
                 try {
                     val scan = withContext(Dispatchers.IO) { rootManager.session?.takeIf { it.active }?.let(RootProbe::scan) }
                     rootScan = scan
-                    rootInfo = rootManager.current()
-                    report = withContext(Dispatchers.IO) { ProbeCollector.collect(this@MainActivity, rootInfo, scan) }
+                    val info = rootManager.current()
+                    rootInfo = info
+                    report = withContext(Dispatchers.IO) { ProbeCollector.collect(this@MainActivity, info, scan) }
                 }
                 catch (e: Exception) { message = "Probe failed: ${e.message}" }
                 busy = false
@@ -94,11 +96,11 @@ class MainActivity : ComponentActivity() {
                                 val result = withContext(Dispatchers.IO) {
                                     val acquired = if (rootManager.current().granted) rootManager.current() else rootManager.request()
                                     val scan = if (acquired.granted) rootManager.session?.let(RootProbe::scan) else null
-                                    Triple(rootManager.current(), scan, acquired)
+                                    rootManager.current() to scan
                                 }
                                 rootInfo = result.first
                                 rootScan = result.second
-                                report = withContext(Dispatchers.IO) { ProbeCollector.collect(this@MainActivity, rootInfo, rootScan) }
+                                report = withContext(Dispatchers.IO) { ProbeCollector.collect(this@MainActivity, result.first, result.second) }
                             } catch (e: Exception) { message = "Root scan failed: ${e.message}" }
                             busy = false
                         }
@@ -112,7 +114,10 @@ class MainActivity : ComponentActivity() {
                     "THERMALS" -> report.thermal
                     "NETWORK" -> report.network
                     "RAW" -> report.rawSources
-                    else -> rootInfo.rows()
+                    else -> rootInfo.rows() + listOf(
+                        TelemetryValue("RAW sources discovered", rootScan?.raw?.size?.toString(), rootScan?.raw?.size?.toString(), null,
+                            "RootProbe.scan", if (rootScan == null) com.systemobservatory.probe.model.Classification.UNAVAILABLE else com.systemobservatory.probe.model.Classification.DERIVED)
+                    )
                 }
                 if (entries.isEmpty()) Text("No sources discovered yet.")
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -129,7 +134,13 @@ private fun TelemetryRow(value: TelemetryValue, collapsible: Boolean) {
     Card(Modifier.fillMaxWidth().clickable { if (collapsible) expanded = !expanded }) {
         Column(Modifier.padding(12.dp)) {
             Text(value.name, style = MaterialTheme.typography.titleMedium)
-            Text(if (value.normalizedValue == null) value.availability.name else "${value.normalizedValue} ${value.unit ?: ""}", style = MaterialTheme.typography.headlineSmall)
+            val display = when {
+                collapsible && !expanded -> value.normalizedValue?.lineSequence()?.firstOrNull()?.take(96) ?: value.availability.name
+                collapsible -> value.normalizedValue?.takeIf { it != value.rawValue }?.let { "$it ${value.unit ?: ""}" } ?: value.availability.name
+                else -> value.normalizedValue?.let { "$it ${value.unit ?: ""}" } ?: value.availability.name
+            }
+            Text(display, style = if (collapsible) MaterialTheme.typography.bodyLarge else MaterialTheme.typography.headlineSmall,
+                maxLines = if (collapsible) 2 else Int.MAX_VALUE, overflow = TextOverflow.Ellipsis)
             Text("${value.classification} · ${value.availability}", style = MaterialTheme.typography.labelMedium)
             if (expanded) {
                 Text("Source: ${value.source}")
