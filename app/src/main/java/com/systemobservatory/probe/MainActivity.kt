@@ -16,24 +16,34 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.systemobservatory.probe.model.ProbeReport
+import com.systemobservatory.probe.model.RootState
 import com.systemobservatory.probe.model.TelemetryValue
+import com.systemobservatory.probe.root.RootManager
 import com.systemobservatory.probe.telemetry.ProbeCollector
 import com.systemobservatory.probe.telemetry.RootProbe
-import com.systemobservatory.probe.telemetry.RootResult
+import com.systemobservatory.probe.telemetry.RootScan
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+    private val rootManager = RootManager()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent { ProbeScreen() }
     }
 
+    override fun onDestroy() {
+        rootManager.close()
+        super.onDestroy()
+    }
+
     @Composable
     private fun ProbeScreen() {
         var report by remember { mutableStateOf(ProbeReport()) }
-        var rootResult by remember { mutableStateOf<RootResult?>(null) }
+        var rootScan by remember { mutableStateOf<RootScan?>(null) }
+        var rootInfo by remember { mutableStateOf(rootManager.info) }
         var selected by remember { mutableStateOf("OVERVIEW") }
         var busy by remember { mutableStateOf(false) }
         var message by remember { mutableStateOf<String?>(null) }
@@ -47,7 +57,12 @@ class MainActivity : ComponentActivity() {
         fun refresh() {
             scope.launch {
                 busy = true
-                try { report = withContext(Dispatchers.IO) { ProbeCollector.collect(this@MainActivity, rootResult) } }
+                try {
+                    val scan = withContext(Dispatchers.IO) { rootManager.session?.takeIf { it.active }?.let(RootProbe::scan) }
+                    rootScan = scan
+                    rootInfo = rootManager.current()
+                    report = withContext(Dispatchers.IO) { ProbeCollector.collect(this@MainActivity, rootInfo, scan) }
+                }
                 catch (e: Exception) { message = "Probe failed: ${e.message}" }
                 busy = false
             }
@@ -55,7 +70,7 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(Unit) { refresh() }
         MaterialTheme {
             Column(Modifier.fillMaxSize().systemBarsPadding().padding(12.dp)) {
-                Text("Telemetry Probe v0.1", style = MaterialTheme.typography.headlineSmall)
+                Text("Telemetry Probe v0.2", style = MaterialTheme.typography.headlineSmall)
                 Text("Local device discovery", style = MaterialTheme.typography.bodySmall)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { refresh() }, enabled = !busy) { Text("Refresh") }
@@ -68,16 +83,27 @@ class MainActivity : ComponentActivity() {
                         FilterChip(selected = selected == tab, onClick = { selected = tab }, label = { Text(tab) })
                     }
                 }
-                if (selected == "ROOT") Button(onClick = {
-                    scope.launch {
-                        busy = true
-                        try {
-                            rootResult = withContext(Dispatchers.IO) { RootProbe.scan() }
-                            report = withContext(Dispatchers.IO) { ProbeCollector.collect(this@MainActivity, rootResult) }
-                        } catch (e: Exception) { message = "Root scan failed: ${e.message}" }
-                        busy = false
-                    }
-                }, enabled = !busy) { Text("Request root and scan") }
+                if (selected == "ROOT") {
+                    Text("ROOT ACCESS", style = MaterialTheme.typography.titleLarge)
+                    Button(onClick = {
+                        scope.launch {
+                            busy = true
+                            message = null
+                            rootInfo = rootInfo.copy(state = RootState.REQUESTING, requestAttempted = true)
+                            try {
+                                val result = withContext(Dispatchers.IO) {
+                                    val acquired = if (rootManager.current().granted) rootManager.current() else rootManager.request()
+                                    val scan = if (acquired.granted) rootManager.session?.let(RootProbe::scan) else null
+                                    Triple(rootManager.current(), scan, acquired)
+                                }
+                                rootInfo = result.first
+                                rootScan = result.second
+                                report = withContext(Dispatchers.IO) { ProbeCollector.collect(this@MainActivity, rootInfo, rootScan) }
+                            } catch (e: Exception) { message = "Root scan failed: ${e.message}" }
+                            busy = false
+                        }
+                    }, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text(if (rootInfo.granted) "RE-RUN ROOT PROBE" else "REQUEST ROOT ACCESS") }
+                }
                 val entries = when (selected) {
                     "OVERVIEW" -> report.device + report.android + report.storage
                     "BATTERY" -> report.battery
@@ -86,7 +112,7 @@ class MainActivity : ComponentActivity() {
                     "THERMALS" -> report.thermal
                     "NETWORK" -> report.network
                     "RAW" -> report.rawSources
-                    else -> report.root
+                    else -> rootInfo.rows()
                 }
                 if (entries.isEmpty()) Text("No sources discovered yet.")
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {

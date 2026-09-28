@@ -1,64 +1,83 @@
 package com.systemobservatory.probe.telemetry
 
+import com.systemobservatory.probe.model.Availability
 import com.systemobservatory.probe.model.Classification
 import com.systemobservatory.probe.model.TelemetryValue
-import java.io.File
+import com.systemobservatory.probe.root.RootSession
+import java.util.Locale
 
-data class RootResult(val status: List<TelemetryValue>, val cpu: List<TelemetryValue>, val thermal: List<TelemetryValue>, val raw: List<TelemetryValue>)
+data class RootScan(
+    val android: List<TelemetryValue> = emptyList(),
+    val cpu: List<TelemetryValue> = emptyList(),
+    val memory: List<TelemetryValue> = emptyList(),
+    val battery: List<TelemetryValue> = emptyList(),
+    val thermal: List<TelemetryValue> = emptyList(),
+    val raw: List<TelemetryValue> = emptyList()
+)
 
+/** Read-only source discovery through a UID-verified RootSession. */
 object RootProbe {
-    fun initial(): List<TelemetryValue> = listOf(
-        direct("Root installed", if (System.getenv("PATH")?.split(':')?.any { File(it, "su").exists() } == true) "YES" else "UNKNOWN", source = "PATH su inspection"),
-        direct("Root granted", "NO", source = "No root request made"),
-        missing("Root implementation/version", "Root not requested")
-    )
-
-    fun scan(): RootResult {
-        val id = try { RootShell.command("id") } catch (e: Exception) {
-            return RootResult(listOf(direct("Root installed", "UNKNOWN", source = "su attempt"), direct("Root granted", "NO", source = "su -c id"), failure("Root access", "su -c id", e)), emptyList(), emptyList(), emptyList())
-        }
-        if (!Regex("(?:^|[ (])uid=0(?:\\(|\\s)").containsMatchIn(id)) {
-            return RootResult(listOf(direct("Root installed", "YES", source = "su -c id"), direct("Root granted", "NO", source = "su -c id"), direct("Identity", id, source = "su -c id")), emptyList(), emptyList(), emptyList())
-        }
-        val version = try { RootShell.command("su -v").take(120) } catch (_: Exception) { null }
-        val status = listOf(direct("Root installed", "YES", source = "su -c id"), direct("Root granted", "YES", source = "su -c id"), direct("Root implementation/version", version, source = "su -v"))
+    fun scan(session: RootSession): RootScan {
         val raw = mutableListOf<TelemetryValue>()
-        listOf("/proc/meminfo", "/proc/uptime", "/proc/stat", "/proc/cpuinfo").forEach { raw += readKernel(it, it.substringAfterLast('/'), true) }
-        val cpu = mutableListOf<TelemetryValue>()
-        val cores = File("/sys/devices/system/cpu").listFiles()?.filter { it.name.matches(Regex("cpu[0-9]+")) }?.sortedBy { it.name } ?: emptyList()
-        cpu += direct("CPU cores discovered", cores.size, source = "/sys/devices/system/cpu/", kind = Classification.DERIVED)
-        for (core in cores) {
-            val base = core.absolutePath
-            val fields = listOf("online", "cpufreq/scaling_cur_freq", "cpufreq/scaling_min_freq", "cpufreq/scaling_max_freq", "cpufreq/scaling_available_governors", "cpufreq/scaling_governor")
-            for (field in fields) {
-                val path = "$base/$field"
-                val entry = if (field == "online" && core.name == "cpu0" && !File(path).exists()) direct("${core.name} online", "1", source = "Kernel CPU0 convention", kind = Classification.DERIVED) else readKernel(path, "${core.name} $field", true)
-                cpu += entry; raw += entry
-            }
+        fun record(value: TelemetryValue): TelemetryValue {
+            if (value.availability == Availability.AVAILABLE) raw += value
+            return value
         }
-        val first = raw.firstOrNull { it.path == "/proc/stat" }?.rawValue?.lineSequence()?.firstOrNull()?.let(Parsers::cpuTotals)
-        val second = try { Thread.sleep(250); Parsers.cpuTotals(RootShell.read("/proc/stat").lineSequence().first()) } catch (_: Exception) { null }
+        fun file(path: String, name: String): TelemetryValue = record(read(session, path, name))
+        val version = file("/proc/version", "Kernel version (root)")
+        val cpuInfo = file("/proc/cpuinfo", "CPU info")
+        val stat = file("/proc/stat", "CPU stat")
+        val memInfo = file("/proc/meminfo", "Memory info")
+        val uptime = file("/proc/uptime", "Kernel uptime")
+
+        val cpu = mutableListOf(cpuInfo, stat)
+        val cpuRoot = "/sys/devices/system/cpu"
+        val coreNames = directories(session, cpuRoot).filter { it.matches(Regex("cpu[0-9]+")) }.sortedBy { it.removePrefix("cpu").toIntOrNull() ?: Int.MAX_VALUE }
+        cpu += if (coreNames.isEmpty()) missing("CPU cores discovered", cpuRoot, reason = "No CPU directories discovered")
+        else direct("CPU cores discovered", coreNames.size, source = cpuRoot, kind = Classification.DERIVED)
+        val cpuFields = listOf("online", "cpufreq/scaling_cur_freq", "cpufreq/scaling_min_freq", "cpufreq/scaling_max_freq", "cpufreq/scaling_available_governors", "cpufreq/scaling_governor")
+        for (core in coreNames) for (field in cpuFields) {
+            val path = "$cpuRoot/$core/$field"
+            val value = file(path, "$core $field")
+            cpu += if (field.endsWith("_freq") && value.availability == Availability.AVAILABLE) value.copy(unit = "kHz") else value
+        }
+        val first = stat.rawValue?.lineSequence()?.firstOrNull()?.let(Parsers::cpuTotals)
+        val second = try { Thread.sleep(250); Parsers.cpuTotals(session.readFile("/proc/stat").lineSequence().first()) } catch (_: Exception) { null }
         val usage = if (first != null && second != null) Parsers.cpuUsage(first, second) else null
-        cpu += if (usage != null) TelemetryValue("CPU usage", "two /proc/stat samples", "%.1f".format(java.util.Locale.US, usage), "%", "/proc/stat", Classification.DERIVED) else missing("CPU usage", "/proc/stat")
+        cpu += if (usage == null) missing("CPU usage", "/proc/stat")
+        else TelemetryValue("CPU usage", "two /proc/stat samples", "%.1f".format(Locale.US, usage), "%", "/proc/stat", Classification.DERIVED)
+
         val thermal = mutableListOf<TelemetryValue>()
-        val zones = File("/sys/class/thermal").listFiles()?.filter { it.name.startsWith("thermal_zone") }?.sortedBy { it.name } ?: emptyList()
-        for (zone in zones) {
-            val type = readKernel("${zone.absolutePath}/type", "${zone.name} type", true)
-            val temp = readKernel("${zone.absolutePath}/temp", "${zone.name} temperature", true)
-            raw += type; raw += temp
+        val thermalRoot = "/sys/class/thermal"
+        for (zone in directories(session, thermalRoot).filter { it.matches(Regex("thermal_zone[0-9]+")) }.sorted()) {
+            val base = "$thermalRoot/$zone"
+            val type = file("$base/type", "$zone type")
+            val temp = read(session, "$base/temp", "$zone temperature")
             thermal += type
             val celsius = temp.rawValue?.let(Parsers::thermalCelsius)
-            thermal += if (celsius == null) temp else temp.copy(normalizedValue = celsius.toString(), unit = "°C", classification = Classification.DERIVED)
+            val normalized = if (celsius == null) temp else temp.copy(normalizedValue = celsius.toString(), unit = "°C", classification = Classification.DERIVED)
+            thermal += record(normalized)
         }
-        val trees = listOf("/sys/class/power_supply" to listOf("type", "status", "capacity", "voltage_now", "current_now", "temp", "charge_now", "energy_now"),
-            "/sys/class/devfreq" to listOf("cur_freq", "min_freq", "max_freq", "governor", "available_governors"))
-        for ((tree, fields) in trees) {
-            val nodes = File(tree).listFiles()?.filter { it.isDirectory }?.sortedBy { it.name } ?: emptyList()
-            for (node in nodes) for (field in fields) {
-                val path = "${node.absolutePath}/$field"
-                if (File(path).exists()) raw += readKernel(path, "${node.name} $field", true)
-            }
-        }
-        return RootResult(status, cpu, thermal, raw)
+
+        val battery = mutableListOf<TelemetryValue>()
+        scanTree(session, "/sys/class/power_supply", listOf("type", "status", "capacity", "voltage_now", "current_now", "temp", "charge_now", "energy_now"), ::record, battery)
+        scanTree(session, "/sys/class/devfreq", listOf("cur_freq", "min_freq", "max_freq", "governor", "available_governors"), ::record, cpu)
+        return RootScan(android = listOf(version, uptime), cpu = cpu, memory = listOf(memInfo), battery = battery, thermal = thermal, raw = raw)
     }
+
+    private fun directories(session: RootSession, path: String): List<String> = try { session.listDirectory(path) } catch (_: Exception) { emptyList() }
+
+    private fun scanTree(session: RootSession, tree: String, fields: List<String>, record: (TelemetryValue) -> TelemetryValue, destination: MutableList<TelemetryValue>) {
+        for (node in directories(session, tree)) for (field in fields) {
+            val path = "$tree/$node/$field"
+            val value = record(read(session, path, "$node $field"))
+            if (value.availability == Availability.AVAILABLE) destination += value
+        }
+    }
+
+    private fun read(session: RootSession, path: String, name: String): TelemetryValue = try {
+        val raw = session.readFile(path).trim()
+        if (raw.isEmpty()) missing(name, path, path, "Empty file")
+        else TelemetryValue(name, raw, raw, null, path, Classification.DIRECT_KERNEL, path = path)
+    } catch (e: Exception) { failure(name, path, e, path) }
 }
